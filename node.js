@@ -9,7 +9,20 @@ const fs = require('fs');
 const path = require('path');
 const { Worker } = require('worker_threads');
 const os = require('os');
-const { AbortController } = require('abort-controller');
+
+// 创建自定义的任务控制器替代AbortController
+function createTaskController() {
+  return {
+    interval: null,
+    aborted: false,
+    abort: function() {
+      this.aborted = true;
+    },
+    isAborted: function() {
+      return this.aborted;
+    }
+  };
+}
 
 // 创建worker.js文件
 const workerScript = `
@@ -23,12 +36,10 @@ parentPort.on('message', ({ url, id }) => {
   const lib = urlObj.protocol === 'https:' ? https : http;
   let bytesDownloaded = 0;
   let running = true;
-  
+
   function download() {
     if (!running) return;
-    
     console.log(\`Worker \${id}: 开始下载 \${url}\`);
-    
     const options = {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -37,7 +48,7 @@ parentPort.on('message', ({ url, id }) => {
       timeout: 10000, // 10秒超时
       rejectUnauthorized: false // 允许自签名证书
     };
-    
+
     const req = lib.get(url, options, (res) => {
       let remoteIP = '';
       if (res.socket && res.socket.remoteAddress) {
@@ -45,19 +56,19 @@ parentPort.on('message', ({ url, id }) => {
         console.log(\`Worker \${id}: 连接到远程IP \${remoteIP}\`);
         parentPort.postMessage({ type: 'ip', ip: remoteIP });
       }
-      
+
       res.on('data', (chunk) => {
         bytesDownloaded += chunk.length;
         parentPort.postMessage({ type: 'progress', bytes: chunk.length });
       });
-      
+
       res.on('end', () => {
         if (running) {
           console.log(\`Worker \${id}: 单次下载完成，将重新开始\`);
           setTimeout(() => download(), 100);
         }
       });
-      
+
       res.on('error', (err) => {
         if (!running) return;
         console.error(\`Worker \${id} 响应错误: \${err.message}\`);
@@ -69,7 +80,7 @@ parentPort.on('message', ({ url, id }) => {
         }, 1000);
       });
     });
-    
+
     req.on('error', (err) => {
       if (!running) return;
       console.error(\`Worker \${id} 请求错误: \${err.message}\`);
@@ -80,7 +91,7 @@ parentPort.on('message', ({ url, id }) => {
         }
       }, 1000);
     });
-    
+
     req.on('timeout', () => {
       console.log(\`Worker \${id}: 请求超时\`);
       req.destroy();
@@ -89,10 +100,10 @@ parentPort.on('message', ({ url, id }) => {
       }
     });
   }
-  
+
   // 开始下载循环
   download();
-  
+
   // 监听停止消息
   parentPort.on('message', (msg) => {
     if (msg.type === 'stop') {
@@ -116,7 +127,7 @@ app.use(express.static('public'));
 
 let downloadRunning = false;
 let totalBytes = 0;
-let currentController = null; // 当前请求的 AbortController
+let currentController = null; // 当前请求的控制器
 let currentTaskStartTime = null; // 当前任务启动时间（毫秒数）
 let records = []; // 保存每次任务的数据记录
 let activeWorkers = []; // 活跃的工作线程
@@ -130,7 +141,6 @@ console.log(`系统有 ${os.cpus().length} 个CPU核心，将使用 ${MAX_THREAD
 function createWorkerPool(url, controller) {
   const workerCount = MAX_THREADS;
   console.log(`启动 ${workerCount} 个下载线程`);
-  
   for (let i = 0; i < workerCount; i++) {
     try {
       const worker = new Worker(path.join(__dirname, 'worker.js'));
@@ -193,7 +203,6 @@ function downloadLoop(downloadUrl, controller) {
     const totalGB = totalBytes / (1024 * 1024 * 1024);
     
     console.log(`统计: ${totalGB.toFixed(3)} GB, 当前速度: ${speedMbps.toFixed(3)} Mbps, IP: ${currentRemoteIP}`);
-    
     io.emit('stats', {
       totalGB: totalGB.toFixed(3),
       lastSpeedMbps: speedMbps.toFixed(3),
@@ -211,7 +220,6 @@ function downloadLoop(downloadUrl, controller) {
 // 终止所有工作线程的助手函数
 function terminateWorkers() {
   console.log(`正在终止 ${activeWorkers.length} 个工作线程`);
-  
   for (const worker of activeWorkers) {
     try {
       worker.postMessage({ type: 'stop' });
@@ -220,7 +228,6 @@ function terminateWorkers() {
       console.error('终止工作线程时发生错误:', err);
     }
   }
-  
   activeWorkers = [];
   console.log('所有工作线程已终止');
 }
@@ -228,12 +235,11 @@ function terminateWorkers() {
 app.post('/start', (req, res) => {
   const { url } = req.body;
   console.log(`收到开始请求，URL: ${url}`);
-  
   if (!url) {
     console.log('请求中缺少URL参数');
     return res.status(400).json({ error: '缺少 URL 参数' });
   }
-  
+
   // 如果有之前未结束的任务，先取消
   if (currentController) {
     console.log('取消之前的未完成任务');
@@ -241,16 +247,15 @@ app.post('/start', (req, res) => {
     if (currentController.interval) {
       clearInterval(currentController.interval);
     }
-    
     terminateWorkers();
     currentController = null;
   }
-  
+
   totalBytes = 0;
   downloadRunning = true;
   currentTaskStartTime = Date.now();
-  currentController = new AbortController();
-  
+  // 使用自定义控制器替代AbortController
+  currentController = createTaskController();
   console.log(`开始新的下载任务: ${url}`);
   downloadLoop(url, currentController);
   
@@ -269,7 +274,6 @@ app.post('/stop', (req, res) => {
     if (currentController.interval) {
       clearInterval(currentController.interval);
     }
-    
     currentController.abort();
     currentController = null;
     
