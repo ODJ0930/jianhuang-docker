@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { Worker } = require('worker_threads');
 const os = require('os');
+const { AbortController } = require('abort-controller');
 
 // 创建worker.js文件
 const workerScript = `
