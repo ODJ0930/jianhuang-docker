@@ -36,9 +36,15 @@ parentPort.on('message', ({ url, id }) => {
   const lib = urlObj.protocol === 'https:' ? https : http;
   let bytesDownloaded = 0;
   let running = true;
+  let paused = false; // 新增暂停状态标志
   
   function download() {
     if (!running) return;
+    if (paused) {
+      // 如果处于暂停状态，等待一段时间后再检查
+      setTimeout(() => download(), 100);
+      return;
+    }
     
     console.log(\`Worker \${id}: 开始下载 \${url}\`);
     
@@ -106,11 +112,21 @@ parentPort.on('message', ({ url, id }) => {
   // 开始下载循环
   download();
   
-  // 监听停止消息
+  // 监听消息
   parentPort.on('message', (msg) => {
     if (msg.type === 'stop') {
       console.log(\`Worker \${id}: 收到停止信号\`);
       running = false;
+    } else if (msg.type === 'pause') {
+      console.log(\`Worker \${id}: 收到暂停信号\`);
+      paused = true;
+    } else if (msg.type === 'resume') {
+      console.log(\`Worker \${id}: 收到恢复信号\`);
+      if (paused) {
+        paused = false;
+        // 如果当前是暂停状态，恢复下载
+        download();
+      }
     }
   });
 });
@@ -135,13 +151,13 @@ let records = []; // 保存每次任务的数据记录
 let activeWorkers = []; // 活跃的工作线程
 let currentRemoteIP = '未知';
 
-// 获取CPU核心数来决定线程数，但最多使用8个线程
-const MAX_THREADS = Math.min(os.cpus().length, 8);
+// 获取CPU核心数来决定线程数，但最多使用64个线程
+const MAX_THREADS = Math.min(os.cpus().length, 64);
 console.log(`系统有 ${os.cpus().length} 个CPU核心，将使用 ${MAX_THREADS} 个下载线程`);
 
 // 创建工作线程
-function createWorkerPool(url, controller) {
-  const workerCount = MAX_THREADS;
+function createWorkerPool(url, controller, customThreadCount) {
+  const workerCount = customThreadCount || MAX_THREADS;
   console.log(`启动 ${workerCount} 个下载线程`);
   
   for (let i = 0; i < workerCount; i++) {
@@ -188,11 +204,12 @@ function createWorkerPool(url, controller) {
   }
 }
 
-function downloadLoop(downloadUrl, controller) {
+// 修改 downloadLoop 函数，使其不依赖于前端连接
+function downloadLoop(downloadUrl, controller, threadCount) {
   if (!downloadRunning) return;
   
   // 创建多个工作线程进行下载
-  createWorkerPool(downloadUrl, controller);
+  createWorkerPool(downloadUrl, controller, threadCount);
   
   const startTime = Date.now();
   let lastTotalBytes = 0;
@@ -207,6 +224,7 @@ function downloadLoop(downloadUrl, controller) {
     
     console.log(`统计: ${totalGB.toFixed(3)} GB, 当前速度: ${speedMbps.toFixed(3)} Mbps, IP: ${currentRemoteIP}`);
     
+    // 即使没有连接的客户端，也继续发送统计数据
     io.emit('stats', {
       totalGB: totalGB.toFixed(3),
       lastSpeedMbps: speedMbps.toFixed(3),
@@ -239,8 +257,8 @@ function terminateWorkers() {
 }
 
 app.post('/start', (req, res) => {
-  const { url } = req.body;
-  console.log(`收到开始请求，URL: ${url}`);
+  const { url, threadCount } = req.body;
+  console.log(`收到开始请求，URL: ${url}, 线程数: ${threadCount || MAX_THREADS}`);
   
   if (!url) {
     console.log('请求中缺少URL参数');
@@ -265,17 +283,61 @@ app.post('/start', (req, res) => {
   currentController = createTaskController();
   
   console.log(`开始新的下载任务: ${url}`);
-  downloadLoop(url, currentController);
+  
+  // 使用用户指定的线程数量，如果未指定则使用系统最大值
+  let userThreadCount;
+  if (threadCount !== null && threadCount !== undefined) {
+    // 确保线程数不超过系统最大值
+    userThreadCount = Math.min(parseInt(threadCount), MAX_THREADS);
+    console.log(`用户指定线程数: ${threadCount}, 调整后: ${userThreadCount}`);
+  } else {
+    userThreadCount = MAX_THREADS;
+    console.log(`使用系统最大线程数: ${userThreadCount}`);
+  }
+  
+  downloadLoop(url, currentController, userThreadCount);
   
   return res.json({
     status: '开始下载',
     url,
-    threads: MAX_THREADS
+    threads: userThreadCount
   });
 });
 
+// 添加 Socket.IO 连接和断开事件处理
+io.on('connection', (socket) => {
+  console.log('客户端已连接:', socket.id);
+  
+  // 如果有正在运行的任务，立即发送当前状态
+  if (downloadRunning && currentController) {
+    socket.emit('task_status', { 
+      running: true,
+      totalGB: (totalBytes / (1024 * 1024 * 1024)).toFixed(3),
+      ip: currentRemoteIP,
+      threads: activeWorkers.length
+    });
+  }
+  
+  socket.on('disconnect', () => {
+    console.log('客户端已断开连接:', socket.id);
+    // 客户端断开连接时不停止下载任务
+  });
+});
+
+// 修改 app.post('/stop') 路由，移除前端关闭页面时自动停止的行为
 app.post('/stop', (req, res) => {
   console.log('收到停止请求');
+  
+  // 检查请求中是否包含 fromBeforeUnload 参数
+  const { fromBeforeUnload } = req.body;
+  
+  // 如果是从 beforeunload 事件发出的请求，不停止下载
+  if (fromBeforeUnload) {
+    console.log('浏览器关闭，但任务将继续运行');
+    return res.json({ status: '浏览器关闭，任务继续运行' });
+  }
+  
+  // 正常停止请求的处理逻辑
   downloadRunning = false;
   
   if (currentController) {
@@ -298,7 +360,7 @@ app.post('/stop', (req, res) => {
       durationSec: durationSec.toFixed(2),
       totalGB: (totalBytes / (1024 * 1024 * 1024)).toFixed(3),
       averageSpeedMbps: durationSec > 0 ? (((totalBytes * 8) / durationSec) / 1e6).toFixed(3) : "0.000",
-      threads: MAX_THREADS
+      threads: activeWorkers.length
     };
     
     console.log('测试记录:', record);
@@ -315,8 +377,17 @@ app.get('/records', (req, res) => {
   res.json(records);
 });
 
+
+
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// 添加获取系统信息的路由
+app.get('/system-info', (req, res) => {
+  res.json({
+    maxThreads: MAX_THREADS
+  });
 });
 
 // 检查并创建public目录
